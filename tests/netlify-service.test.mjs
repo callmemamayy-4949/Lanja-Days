@@ -11,6 +11,14 @@ class Store{
  async delete(key){this.items.delete(key);}
 }
 
+test('public calendar remains readable before admin credentials are configured',async()=>{
+ const api=createService({seed,visitsStore:new Store(),sessionsStore:new Store(),attemptsStore:new Store()});
+ const state=await(await api.state(new Request('https://lanja.example/api/state'))).json();
+ assert.equal(state.visits.length,seed.visits.length);
+ assert.equal(state.children.length,seed.children.length);
+ assert.equal((await api.login(new Request('https://lanja.example/api/login',{method:'POST'}))).status,503);
+});
+
 test('Netlify API preserves seed visits and protects edits with an HTTPS admin session',async()=>{
  const visitsStore=new Store(),sessionsStore=new Store(),attemptsStore=new Store();
  const api=createService({seed,visitsStore,sessionsStore,attemptsStore,adminUsername:'test-admin',adminPassword:'test-secret-123!'});
