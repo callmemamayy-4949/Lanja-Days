@@ -1,0 +1,23 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {spawn} from 'node:child_process';import {mkdtempSync} from 'node:fs';import {tmpdir} from 'node:os';import path from 'node:path';import {once} from 'node:events';import http from 'node:http';
+test('authentication, multi-child persistence, validation and logout',async()=>{
+ const folder=mkdtempSync(path.join(tmpdir(),'laan-test-')),port=3097,origin=`http://127.0.0.1:${port}`;let processHandle;
+ async function start(){processHandle=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:String(port),LAAN_DATA_DIR:folder,ADMIN_USERNAME:'test-admin',ADMIN_PASSWORD:'test-secret-123!'},stdio:['ignore','pipe','pipe']});await new Promise((resolve,reject)=>{processHandle.stdout.once('data',resolve);processHandle.once('error',reject);processHandle.once('exit',()=>reject(Error('Server exited')));});}
+ async function stop(){const exited=once(processHandle,'exit');processHandle.kill();await exited;}
+ let cookie='';async function call(route,method='GET',body,customOrigin=origin){return fetch(origin+route,{method,headers:{origin:customOrigin,cookie,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});}
+ try{await start();let state=await(await call('/api/state')).json();assert.equal(state.children.length,33);assert.equal(state.authenticated,false);assert.equal((await call('/api/day','PUT',{date:'2026-08-01',ids:['1','2']})).status,401);const password='test-secret-123!';const login=await call('/api/login','POST',{username:'test-admin',password});assert.equal(login.status,200);cookie=login.headers.get('set-cookie').split(';')[0];assert.equal((await call('/api/day','PUT',{date:'2026-08-01',ids:['1','2','3','4']})).status,200);assert.equal((await(await call('/api/state')).json()).visits.length,4);assert.equal((await call('/api/day','PUT',{date:'2026-08-01',ids:['2']})).status,200);assert.equal((await call('/api/day','PUT',{date:'2026-02-30',ids:[]})).status,400);assert.equal((await call('/api/day','PUT',{date:'2099-01-01',ids:[]})).status,400);assert.equal((await call('/api/day','PUT',{date:'2026-08-01',ids:[]},'https://evil.example')).status,403);assert.equal((await call('/data/admin-access.txt')).status,404);assert.equal((await call('/.env')).status,404);assert.equal((await call('/api/login','POST',{username:'admin',password})).status,401);await stop();await start();state=await(await call('/api/state')).json();assert.deepEqual(state.visits,[{date:'2026-08-01',child:'2'}]);assert.equal(state.authenticated,false);const relogin=await call('/api/login','POST',{username:'test-admin',password});cookie=relogin.headers.get('set-cookie').split(';')[0];await call('/api/logout','POST',{});assert.equal((await call('/api/day','PUT',{date:'2026-08-01',ids:[]})).status,401);
+ }finally{if(processHandle?.exitCode===null)await stop();}
+});
+
+test('public HTTPS origin accepts its domain and sets a secure admin cookie',async()=>{
+ const folder=mkdtempSync(path.join(tmpdir(),'laan-public-test-')),port=3098,publicOrigin='https://laan.example';
+ const server=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:String(port),LAAN_DATA_DIR:folder,LAAN_BIND_HOST:'127.0.0.1',PUBLIC_ORIGIN:publicOrigin,ADMIN_USERNAME:'test-admin',ADMIN_PASSWORD:'test-secret-123!'},stdio:['ignore','pipe','pipe']});
+ try{
+  await new Promise((resolve,reject)=>{server.stdout.once('data',resolve);server.once('error',reject);server.once('exit',()=>reject(Error('Server exited')));});
+  const request=(route,host,origin,body)=>new Promise((resolve,reject)=>{const req=http.request({hostname:'127.0.0.1',port,path:route,method:body?'POST':'GET',headers:{Host:host,...(origin?{Origin:origin}:{}),...(body?{'Content-Type':'application/json'}:{})}},res=>{res.resume();res.on('end',()=>resolve(res));});req.on('error',reject);req.end(body);});
+  assert.equal((await request('/api/state','laan.example')).statusCode,200);
+  assert.equal((await request('/api/state','wrong.example')).statusCode,403);
+  const login=await request('/api/login','laan.example',publicOrigin,JSON.stringify({username:'test-admin',password:'test-secret-123!'}));
+  assert.equal(login.statusCode,200);assert.match(login.headers['set-cookie'][0],/; Secure/);
+  assert.equal((await request('/api/login','laan.example','http://laan.example','{}')).statusCode,403);
+ }finally{if(server.exitCode===null){const exited=once(server,'exit');server.kill();await exited;}}
+});

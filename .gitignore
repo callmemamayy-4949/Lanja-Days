@@ -1,0 +1,8 @@
+.env
+data/
+*.log
+after-current-browser.png
+node_modules/
+.tmp-*/
+dist/
+.netlify/

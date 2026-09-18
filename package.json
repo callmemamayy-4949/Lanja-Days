@@ -1,0 +1,1 @@
+{"name":"laan-calendar","private":true,"type":"module","scripts":{"start":"node server.mjs","test":"node --test tests/*.test.mjs","backup":"node scripts/backup.mjs","export:netlify":"node scripts/export-netlify.mjs","build:netlify":"node scripts/build-netlify.mjs"},"dependencies":{"@netlify/blobs":"^11.1.0"}}
