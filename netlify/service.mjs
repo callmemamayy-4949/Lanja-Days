@@ -1,5 +1,7 @@
 import {createHash,randomBytes,scryptSync,timingSafeEqual} from 'node:crypto';
 import {predict} from '../forecast.mjs';
+import {captureForecasts,forecastHistory} from '../forecast-history.mjs';
+import {withBirthdays} from '../birthdays.mjs';
 
 const cookieName='laan_session';
 const sessionLength=8*60*60*1000;
@@ -15,14 +17,24 @@ const parseBody=async request=>{const raw=await request.text();if(raw.length>200
 export function createService({seed,visitsStore,sessionsStore,attemptsStore,adminUsername,adminPassword,now=Date.now}){
  const adminConfigured=!!adminUsername&&!!adminPassword&&adminPassword.length<256;
  const salt=adminConfigured?randomBytes(16).toString('hex'):null,passwordHash=adminConfigured?scryptSync(adminPassword,salt,64):null;
- const children=seed.children.map(({file,...child})=>child);
+ const children=withBirthdays(seed.children.map(({file,...child})=>child));
  const childIds=new Set(children.map(child=>child.id));
- const readVisits=async()=>{const entry=await visitsStore.getWithMetadata('visits',{type:'json'});return {visits:entry?.data??seed.visits,etag:entry?.etag};};
+ const readVisits=async()=>{const entry=await visitsStore.getWithMetadata('visits',{type:'json'});const saved=entry?.data;return {visits:Array.isArray(saved)?saved:saved?.visits??seed.visits,confirmedDays:saved?.confirmedDays??[],etag:entry?.etag};};
  const authenticated=async request=>{const token=readCookie(request);if(!token)return false;const session=await sessionsStore.get(hash(token),{type:'json'});return !!session&&session.expiresAt>now();};
- const state=async request=>{if(request.method!=='GET')return json({error:'ไม่รองรับคำขอนี้'},405);const {visits}=await readVisits();return json({today:today(),authenticated:await authenticated(request),children,visits,forecasts:children.map(child=>({child:child.id,...predict(visits.filter(visit=>visit.child===child.id).map(visit=>visit.date),today())}))});};
+ const capture=async(visits,currentDay)=>{
+  for(let retry=0;retry<5;retry++){
+   const entry=await visitsStore.getWithMetadata('forecast-history',{type:'json'});
+   const previous=entry?.data??{},history=captureForecasts(children,visits,currentDay,previous);
+   if(Object.keys(previous).length===Object.keys(history).length)return history;
+   const result=await visitsStore.setJSON('forecast-history',history,entry?.etag?{onlyIfMatch:entry.etag}:{onlyIfNew:true});
+   if(result.modified)return history;
+  }
+  throw Error('Could not save forecast history');
+ };
+ const state=async request=>{if(request.method!=='GET')return json({error:'ไม่รองรับคำขอนี้'},405);const {visits,confirmedDays}=await readVisits();const currentDay=today(),isAuthenticated=await authenticated(request),history=await capture(visits,currentDay);return json({today:currentDay,authenticated:isAuthenticated,children,visits,forecasts:children.map(child=>({child:child.id,...predict(visits.filter(visit=>visit.child===child.id).map(visit=>visit.date),currentDay)})),...(isAuthenticated?{forecastHistory:forecastHistory(visits,confirmedDays,history,currentDay)}:{})});};
  const login=async request=>{if(request.method!=='POST')return json({error:'ไม่รองรับคำขอนี้'},405);if(!adminConfigured)return json({error:'ยังไม่ได้ตั้งค่าบัญชีแอดมิน'},503);if(!sameOrigin(request))return json({error:'คำขอไม่ถูกต้อง'},403);const body=await parseBody(request);const ip=request.headers.get('x-nf-client-connection-ip')||request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()||'unknown';const attemptKey=hash(ip);const prior=await attemptsStore.get(attemptKey,{type:'json'});const attempt=prior?.until>now()?prior:{count:0,until:now()+attemptWindow};if(attempt.count>=8)return json({error:'ลองใหม่ใน 15 นาที'},429);attempt.count++;await attemptsStore.setJSON(attemptKey,attempt);const valid=body.username===adminUsername&&typeof body.password==='string'&&body.password.length<256&&timingSafeEqual(passwordHash,scryptSync(body.password,salt,64));if(!valid)return json({error:'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง'},401);await attemptsStore.delete(attemptKey);const token=randomBytes(32).toString('hex');await sessionsStore.setJSON(hash(token),{expiresAt:now()+sessionLength});return json({ok:true},200,{'Set-Cookie':cookie(request,token,28800)});};
  const logout=async request=>{if(request.method!=='POST')return json({error:'ไม่รองรับคำขอนี้'},405);if(!sameOrigin(request))return json({error:'คำขอไม่ถูกต้อง'},403);const token=readCookie(request);if(token)await sessionsStore.delete(hash(token));return json({ok:true},200,{'Set-Cookie':cookie(request,'',0)});};
- const day=async request=>{if(request.method!=='PUT')return json({error:'ไม่รองรับคำขอนี้'},405);if(!sameOrigin(request))return json({error:'คำขอไม่ถูกต้อง'},403);if(!await authenticated(request))return json({error:'กรุณาเข้าสู่ระบบแอดมิน'},401);const body=await parseBody(request);const {date,ids}=body;if(typeof date!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(date)||!Number.isFinite(Date.parse(date))||new Date(date).toISOString().slice(0,10)!==date||date<'2026-08-01'||date>today()||!Array.isArray(ids)||ids.length>children.length||ids.some(id=>!childIds.has(id)))return json({error:'วันที่หรือรายชื่อไม่ถูกต้อง บันทึกได้ถึงวันนี้เท่านั้น'},400);const {visits,etag}=await readVisits();const next=visits.filter(visit=>visit.date!==date);for(const id of new Set(ids))next.push({date,child:id});next.sort((a,b)=>a.date.localeCompare(b.date)||Number(a.child)-Number(b.child));const result=await visitsStore.setJSON('visits',next,etag?{onlyIfMatch:etag}:{onlyIfNew:true});if(!result.modified)return json({error:'มีการบันทึกพร้อมกัน กรุณาโหลดหน้าใหม่แล้วลองอีกครั้ง'},409);return json({ok:true});};
+ const day=async request=>{if(request.method!=='PUT')return json({error:'ไม่รองรับคำขอนี้'},405);if(!sameOrigin(request))return json({error:'คำขอไม่ถูกต้อง'},403);if(!await authenticated(request))return json({error:'กรุณาเข้าสู่ระบบแอดมิน'},401);const body=await parseBody(request);const {date,ids}=body;if(typeof date!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(date)||!Number.isFinite(Date.parse(date))||new Date(date).toISOString().slice(0,10)!==date||date<'2026-08-01'||date>today()||!Array.isArray(ids)||ids.length>children.length||ids.some(id=>!childIds.has(id)))return json({error:'วันที่หรือรายชื่อไม่ถูกต้อง บันทึกได้ถึงวันนี้เท่านั้น'},400);const {visits,confirmedDays,etag}=await readVisits();const next=visits.filter(visit=>visit.date!==date);for(const id of new Set(ids))next.push({date,child:id});next.sort((a,b)=>a.date.localeCompare(b.date)||Number(a.child)-Number(b.child));const result=await visitsStore.setJSON('visits',{visits:next,confirmedDays:[...new Set([...confirmedDays,date])]},etag?{onlyIfMatch:etag}:{onlyIfNew:true});if(!result.modified)return json({error:'มีการบันทึกพร้อมกัน กรุณาโหลดหน้าใหม่แล้วลองอีกครั้ง'},409);return json({ok:true});};
  return {state,login,logout,day};
 }
 
